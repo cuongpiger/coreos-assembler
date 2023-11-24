@@ -86,6 +86,7 @@ var (
 		"iso-offline-install.bios",
 		"iso-offline-install.mpath.bios",
 		"iso-offline-install-fromram.4k.uefi",
+		"iso-install-iscsi",
 		"miniso-install.bios",
 		"miniso-install.nm.bios",
 		"miniso-install.4k.uefi",
@@ -573,6 +574,8 @@ func runTestIso(cmd *cobra.Command, args []string) error {
 			duration, err = testLiveIso(ctx, inst, filepath.Join(outputDir, test), false)
 		case "miniso-install":
 			duration, err = testLiveIso(ctx, inst, filepath.Join(outputDir, test), true)
+		case "iso-install-iscsi":
+			duration, err = testLiveInstalliscsi(ctx, inst, filepath.Join(outputDir, test))
 		default:
 			plog.Fatalf("Unknown test name:%s", test)
 		}
@@ -930,4 +933,70 @@ func testAsDisk(ctx context.Context, outdir string) (time.Duration, error) {
 	defer mach.Destroy()
 
 	return awaitCompletion(ctx, mach, outdir, completionChannel, nil, []string{liveOKSignal})
+}
+
+// iscsi.go contain the full butane config but here is an overview of the setup
+// 1 - Boot a live ISO with an extra 10G disk with label "target"
+// 2 - target.container -> start an iscsi target, using quay.io/jbtrystram/targetcli
+// 3 - setup-targetcli.service calls /usr/local/bin/targetcli_script:
+//
+//	instructs targetcli to serve /dev/disk/by-id/virtio-target as an iscsi target
+//	disables authentication
+//	verifies the iscsi service is active and reachable
+//
+// 4 - install-coreos-to-iscsi-target.service calls /usr/local/bin/install-coreos-iscsi:
+//   - mount iscsi target
+//   - coreosInstaller on the mounted block device
+//   - unmount iscsi
+//
+// 5 - boot-iscsi-coreos-vm.service calls /usr/local/bin/boot-coreos-iscsi-vm:
+//   - launch cosa qemuexec instructing it to boot from an iPXE script wich in turns mount the iscsi target and load kernel
+//   - verify it's sucessfully booted by grepping the console output
+//   - propagate the success to testiscsicompletion serial device
+func testLiveInstalliscsi(ctx context.Context, inst platform.Install, outdir string) (time.Duration, error) {
+
+	builddir := kola.CosaBuild.Dir
+	isopath := filepath.Join(builddir, kola.CosaBuild.Meta.BuildArtifacts.LiveIso.Path)
+	builder, err := newBaseQemuBuilder(outdir)
+	if err != nil {
+		return 0, err
+	}
+	defer builder.Close()
+	if err := builder.AddIso(isopath, "", false); err != nil {
+		return 0, err
+	}
+
+	completionChannel, err := builder.VirtioChannelRead("testiscsicompletion")
+	if err != nil {
+		return 0, err
+	}
+
+	// empty disk to use as an iscsi target to install coreOS on and subseqently boot
+	err = builder.AddDisksFromSpecs([]string{"10G:serial=target"})
+	if err != nil {
+		return 0, err
+	}
+
+	// We need more memory to pull cosa and start another VM within !
+	builder.MemoryMiB = 4096
+
+	config, err := iscsiTargetConfig.Render(conf.FailWarnings)
+	if err != nil {
+		return 0, err
+	}
+
+	// for debug purposes
+	config.AddAutoLogin()
+
+	// enable network
+	builder.AppendKernelArgs = "rd.neednet=1 ip=dhcp"
+	builder.SetConfig(config)
+
+	mach, err := builder.Exec()
+	if err != nil {
+		return 0, errors.Wrapf(err, "running iso")
+	}
+	defer mach.Destroy()
+
+	return awaitCompletion(ctx, mach, outdir, completionChannel, nil, []string{"iscsi-boot-ok"})
 }
