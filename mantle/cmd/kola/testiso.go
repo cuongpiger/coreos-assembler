@@ -936,21 +936,24 @@ func testAsDisk(ctx context.Context, outdir string) (time.Duration, error) {
 }
 
 // iscsi.go contain the full butane config but here is an overview of the setup
-// 1 - Boot a live ISO with an extra 10G disk with label "target"
+// 1 - Boot a live ISO with two extra 10G disks with labels "target" and "var"
+//   - Format and mount `virtio-var` to var
+//
 // 2 - target.container -> start an iscsi target, using quay.io/jbtrystram/targetcli
 // 3 - setup-targetcli.service calls /usr/local/bin/targetcli_script:
-//
-//	instructs targetcli to serve /dev/disk/by-id/virtio-target as an iscsi target
-//	disables authentication
-//	verifies the iscsi service is active and reachable
+//   - instructs targetcli to serve /dev/disk/by-id/virtio-target as an iscsi target
+//   - disables authentication
+//   - verifies the iscsi service is active and reachable
 //
 // 4 - install-coreos-to-iscsi-target.service calls /usr/local/bin/install-coreos-iscsi:
 //   - mount iscsi target
-//   - coreosInstaller on the mounted block device
+//   - run coreos-installer on the mounted block device
 //   - unmount iscsi
 //
-// 5 - boot-iscsi-coreos-vm.service calls /usr/local/bin/boot-coreos-iscsi-vm:
+// 5 - coreos-iscsi-vm.container start a coreos-assemble:
 //   - launch cosa qemuexec instructing it to boot from an iPXE script wich in turns mount the iscsi target and load kernel
+//
+// 6 - verify-iscsi-boot-success.service calls /usr/local/bin/verify-iscsi-boot-success:
 //   - verify it's sucessfully booted by grepping the console output
 //   - propagate the success to testiscsicompletion serial device
 func testLiveInstalliscsi(ctx context.Context, inst platform.Install, outdir string) (time.Duration, error) {
@@ -972,13 +975,14 @@ func testLiveInstalliscsi(ctx context.Context, inst platform.Install, outdir str
 	}
 
 	// empty disk to use as an iscsi target to install coreOS on and subseqently boot
-	err = builder.AddDisksFromSpecs([]string{"10G:serial=target"})
+	// Also add a 10G disk that we will mount on /var, to increase space available when pulling containers
+	err = builder.AddDisksFromSpecs([]string{"10G:serial=target", "10G:serial=var"})
 	if err != nil {
 		return 0, err
 	}
 
 	// We need more memory to pull cosa and start another VM within !
-	builder.MemoryMiB = 4096
+	builder.MemoryMiB = 6144
 
 	config, err := iscsiTargetConfig.Render(conf.FailWarnings)
 	if err != nil {
@@ -989,7 +993,11 @@ func testLiveInstalliscsi(ctx context.Context, inst platform.Install, outdir str
 	config.AddAutoLogin()
 
 	// enable network
-	builder.AppendKernelArgs = "rd.neednet=1 ip=dhcp"
+	h := []platform.HostForwardPort{
+		{Service: "ssh", HostPort: 0, GuestPort: 22},
+	}
+	builder.EnableUsermodeNetworking(h, "")
+
 	builder.SetConfig(config)
 
 	mach, err := builder.Exec()

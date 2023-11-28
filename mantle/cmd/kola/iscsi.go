@@ -23,6 +23,13 @@ var iscsiTargetConfig = conf.Butane(`
 variant: fcos
 version: 1.5.0
 storage:
+  filesystems:
+    - path: /var
+      device: /dev/disk/by-id/virtio-var
+      format: ext4
+      wipe_filesystem: true
+      label: var
+      with_mount_unit: true
   files:
     - path: /etc/containers/systemd/target.container
       contents:
@@ -31,7 +38,7 @@ storage:
             Description=Targetd container
             Documentation=https://github.com/jbtrystram/targetcli-containers
             After=local-fs.target
-            After=network-online.target, dev-disk-by\x2did-virtio\x2dtarget.device
+            After=network-online.target, After=nss-lookup.target, dev-disk-by\x2did-virtio\x2dtarget.device
             Wants=network-online.target
             [Container]
             Image=quay.io/jbtrystram/targetcli:latest
@@ -81,27 +88,38 @@ storage:
           # Install coreos
           # FIXME How are we sure this is the iscsi mounted disk ?
           # (if it's sda it should be, because virtio disks are usually /dev/vda)
-          coreos-installer install /dev/sda --append-karg rd.iscsi.firmware=1 --append-karg ip=ibft
+          coreos-installer install /dev/sda --append-karg rd.iscsi.firmware=1 --append-karg ip=ibft --append-karg console=ttyS0
           # Unmount the disk
           iscsiadm --mode node --logoutall=all
-    - path: /usr/local/bin/boot-coreos-iscsi-vm
+    - path: /etc/containers/systemd/coreos-iscsi-vm.container
+      contents:
+        inline: |
+          [Unit]
+          Description=start coreOS VM through COSA, booting from iSCSI
+          After=network-online.target, After=nss-lookup.target, install-coreos-to-iscsi-target.service 
+          Wants=network-online.target,install-coreos-to-iscsi-target.service 
+          Requires=install-coreos-to-iscsi-target.service
+          [Container]
+          Image=quay.io/coreos-assembler/coreos-assembler
+          ContainerName=iscsiboot
+          Volume=/mnt/temp/:/mnt/temp/
+          PodmanArgs=--privileged
+          Network=host
+          Exec=kola qemuexec --netboot /mnt/temp/boot.ipxe --usernet-addr 10.0.3.0/24
+          [Install]
+          # Start by default on boot
+          WantedBy=multi-user.target
+          [Service]
+          # Extend Timeout to allow time to pull the image
+          TimeoutStartSec=900
+    - path: /usr/local/bin/verify-iscsi-boot-success
       mode: 0755
       contents:
         inline: |
           #!/bin/bash
           set -euxo
-          # start coreOS through COSA
-          # FIXME : make a .container unit out of this ?
-          podman run -ti --privileged --net=host --name iscsiboot --rm \
-              -v /mnt/temp/boot.ipxe:/mnt/temp/boot.ipxe \
-              -v /mnt/workdir:/mnt/workdir \
-              quay.io/coreos-assembler/coreos-assembler shell \
-              -- kola qemuexec --netboot /mnt/temp/boot.ipxe --usernet-addr 10.0.3.0/24
-          # wait a little bit to let it boot
-          sleep 30
           # verify successful boot
-          #journalctl --unit iscsi-boot  -g '.*OK.*multi-user\.target' -o cat -q
-          podman logs iscsiboot | grep '.*OK.*multi-user\.target'
+          journalctl --unit coreos-iscsi-vm  -g '.*OK.*multi-user\.target' -o cat -q
           # Propagate success
           /usr/bin/echo "iscsi-boot-ok" >/dev/virtio-ports/testisocompletion
 systemd:
@@ -133,16 +151,19 @@ systemd:
         ExecStart=/usr/local/bin/install-coreos-iscsi
         [Install]
         WantedBy=multi-user.target
-    - name: boot-iscsi-coreos-vm.service
+    - name: verify-iscsi-boot-success.service
       enabled: true
       contents: |
-          [Unit]
-          Description=Boot a coreOS VM through cosa from an iscsi target
-          Requires=install-coreos-to-iscsi-target.service
-          After=install-coreos-to-iscsi-target.service
-          [Service]
-          Type=oneshot
-          RemainAfterExit=yes
-          ExecStart=/usr/local/bin/boot-coreos-iscsi-vm
-          [Install]
-          WantedBy=multi-user.target`)
+        [Unit]
+        Description=Validates complete boot of the nested VM from iscsi
+        Requires=coreos-iscsi-vm.service
+        After=coreos-iscsi-vm.service
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        # Wait a while : container pull, VM creation, boot process
+        # TODO trigger on a path watch
+        ExecStartPre=/bin/sleep 40
+        ExecStart=/usr/local/bin/verify-iscsi-boot-success
+        [Install]
+        WantedBy=multi-user.target`)
