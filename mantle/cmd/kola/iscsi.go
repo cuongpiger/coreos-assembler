@@ -69,7 +69,7 @@ storage:
             "
             # Will return 0 if the discovery yield a valid portal
             iscsiadm -m discovery -p 127.0.0.1 -t st | grep iqn.2023-10.coreos.target.vm:coreos
-    - path: /mnt/temp/boot.ipxe
+    - path: /mnt/workdir-tmp/boot.ipxe
       mode: 0644
       contents:
         inline: |
@@ -88,7 +88,7 @@ storage:
           # Install coreos
           # FIXME How are we sure this is the iscsi mounted disk ?
           # (if it's sda it should be, because virtio disks are usually /dev/vda)
-          coreos-installer install /dev/sda --append-karg rd.iscsi.firmware=1 --append-karg ip=ibft --append-karg console=ttyS0
+          coreos-installer install /dev/sda --append-karg rd.iscsi.firmware=1 --append-karg ip=ibft --console ttyS0 -i /mnt/workdir-tmp/nested-ign.json
           # Unmount the disk
           iscsiadm --mode node --logoutall=all
     - path: /etc/containers/systemd/coreos-iscsi-vm.container
@@ -102,10 +102,10 @@ storage:
           [Container]
           Image=quay.io/coreos-assembler/coreos-assembler
           ContainerName=iscsiboot
-          Volume=/mnt/temp/:/mnt/temp/
+          Volume=/mnt/workdir-tmp/:/mnt/workdir-tmp/
           PodmanArgs=--privileged
           Network=host
-          Exec=kola qemuexec --netboot /mnt/temp/boot.ipxe --usernet-addr 10.0.3.0/24
+          Exec=kola qemuexec --netboot /mnt/workdir-tmp/boot.ipxe --usernet-addr 10.0.3.0/24
           [Install]
           # Start by default on boot
           WantedBy=multi-user.target
